@@ -28,6 +28,9 @@
   },
   "dependencies": {
     "@evolu/common": "workspace:*",
+    "@libsql/client": "^0.14.0",
+    "@libsql/kysely-libsql": "^0.4.1",
+    "axios": "^1.7.9",
     "better-sqlite3": "^11.0.0",
     "body-parser": "^1.20.2",
     "cors": "^2.8.5",
