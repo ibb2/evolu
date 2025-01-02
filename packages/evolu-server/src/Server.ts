@@ -139,11 +139,20 @@ export const ServerLive = Layer.effect(
                 }),
             ),
           );
+          const currentMerkleTreeString = merkleTreeToString(merkleTree);
+          yield* _(
+            Effect.logDebug([
+              "Merkle trees comparison",
+              {
+                currentMerkleTree: currentMerkleTreeString,
+                requestMerkleTree: request.merkleTree,
+                areEqual: currentMerkleTreeString === request.merkleTree,
+              },
+            ]),
+          );
+
           const messages = yield* _(
-            diffMerkleTrees(
-              merkleTree,
-              unsafeMerkleTreeFromString(request.merkleTree),
-            ),
+            diffMerkleTrees(merkleTree, unsafeMerkleTreeFromString(request.merkleTree)),
             Effect.map(makeSyncTimestamp),
             Effect.map(timestampToString),
             Effect.flatMap((timestamp) =>
@@ -153,24 +162,46 @@ export const ServerLive = Layer.effect(
                   .select(["timestamp", "content"])
                   .where("userId", "=", request.userId)
                   .where("timestamp", ">=", timestamp)
-                  .where(
-                    "timestamp",
-                    "not like",
-                    sql<TimestampString>`'%' || ${request.nodeId}`,
-                  )
                   .orderBy("timestamp")
+                  .limit(20)
                   .execute(),
               ),
             ),
-            Effect.orElseSucceed(() => []),
+            Effect.map((msgs) => 
+              msgs.map(msg => ({
+                timestamp: msg.timestamp,
+                content: msg.content instanceof Uint8Array ? msg.content : new Uint8Array(msg.content),
+              }))
+            ),
+            Effect.catchAll(() => Effect.succeed([])),
           );
 
-          const response = SyncResponse.toBinary({
-            merkleTree: merkleTreeToString(merkleTree),
-            messages,
-          });
+          yield* _(
+            Effect.logDebug([
+              "Messages to sync",
+              {
+                count: messages.length,
+                timestamps: messages.map(m => m.timestamp),
+              },
+            ]),
+          );
 
-          return Buffer.from(response);
+          const syncResponse = {
+            merkleTree: currentMerkleTreeString,
+            messages,
+          };
+
+          try {
+            const response = SyncResponse.toBinary(syncResponse);
+            return Buffer.from(response);
+          } catch (error) {
+            return yield* _(
+              Effect.fail({
+                _tag: "BadRequestError" as const,
+                error: new Error(`Serialization failed: ${error}`),
+              }),
+            );
+          }
         }),
     });
   }),

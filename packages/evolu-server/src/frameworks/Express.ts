@@ -28,6 +28,18 @@ interface TursoApiResponse {
   database: TursoDatabase;
 }
 
+interface TursoTokenResponse {
+  jwt: string;
+}
+
+interface TursoCreateResponse {
+  database: {
+    DbId: string;
+    Hostname: string;
+    Name: string;
+  };
+}
+
 // Environment variables validation
 const getRequiredEnvVar = (name: string): string => {
   const value = process.env[name];
@@ -50,29 +62,51 @@ const socketUserMap: { [key: string]: WebSocket[] | undefined } = {};
 // Cache for database connections
 const dbConnections: { [userId: string]: Kysely<Database> } = {};
 
+// Cache for database tokens
+const dbTokens: { [dbName: string]: string } = {};
+
 // Function to create a child database for a user
-const createChildDatabase = async (userId: string): Promise<string> => {
-  // Sanitize the userId to only include allowed characters (numbers, lowercase letters, and dashes)
+const createChildDatabase = async (userId: string) => {
   const sanitizedUserId = userId.toLowerCase().replace(/[^a-z0-9-]/g, '-');
-  const dbName = `evolu-child-${sanitizedUserId}`;
+  const dbName = `evolu-${sanitizedUserId}`;
   
   try {
-    // First, get the parent database ID
-    const parentDbResponse = await axios.get<TursoApiResponse>(
-      `https://api.turso.tech/v1/organizations/${config.tursoOrgSlug}/databases/${config.tursoParentDb}`,
-      {
-        headers: {
-          Authorization: `Bearer ${config.tursoApiToken}`,
-          "Content-Type": "application/json",
-        },
+    // First, check if the database already exists
+    try {
+      const checkDbResponse = await axios.get<TursoApiResponse>(
+        `https://api.turso.tech/v1/organizations/${config.tursoOrgSlug}/databases/${dbName}`,
+        {
+          headers: {
+            Authorization: `Bearer ${config.tursoApiToken}`,
+            "Content-Type": "application/json",
+          },
+        }
+      );
+      
+      // If database exists, still need to get a token
+      const tokenResponse = await axios.post<TursoTokenResponse>(
+        `https://api.turso.tech/v1/organizations/${config.tursoOrgSlug}/databases/${dbName}/auth/tokens`,
+        {},
+        {
+          headers: {
+            Authorization: `Bearer ${config.tursoApiToken}`,
+            "Content-Type": "application/json",
+          },
+        }
+      );
+      
+      dbTokens[dbName] = tokenResponse.data.jwt;
+      return dbName;
+    } catch (checkError) {
+      // If error is not 404 (Not Found), rethrow it
+      if (axios.isAxiosError(checkError) && checkError.response?.status !== 404) {
+        throw checkError;
       }
-    );
-
-    // eslint-disable-next-line no-console
-    console.log("Parent DB Response:", parentDbResponse.data);
-
-    // Create child database with parent's name as schema
-    const createResponse = await axios.post(
+      // If 404, continue with creation
+    }
+    
+    // Create child database from parent
+    const createResponse = await axios.post<TursoCreateResponse>(
       `https://api.turso.tech/v1/organizations/${config.tursoOrgSlug}/databases`,
       {
         name: dbName,
@@ -87,17 +121,29 @@ const createChildDatabase = async (userId: string): Promise<string> => {
         },
       }
     );
-
-    // eslint-disable-next-line no-console
-    console.log("Create DB Response:", createResponse.data);
+    
+    // Wait for database to be ready
+    await new Promise(resolve => setTimeout(resolve, 2000));
+    
+    // Get a new auth token for the child database
+    const tokenResponse = await axios.post<TursoTokenResponse>(
+      `https://api.turso.tech/v1/organizations/${config.tursoOrgSlug}/databases/${dbName}/auth/tokens`,
+      {},
+      {
+        headers: {
+          Authorization: `Bearer ${config.tursoApiToken}`,
+          "Content-Type": "application/json",
+        },
+      }
+    );
+    
+    // Store the token for this database
+    dbTokens[dbName] = tokenResponse.data.jwt;
+    
     return dbName;
   } catch (error) {
+    console.error("Database creation error:", error);
     if (axios.isAxiosError(error)) {
-      if (error.response?.status === 409) {
-        // Database already exists
-        return dbName;
-      }
-      // eslint-disable-next-line no-console
       console.error("API Error Response:", {
         status: error.response?.status,
         data: error.response?.data,
@@ -108,27 +154,40 @@ const createChildDatabase = async (userId: string): Promise<string> => {
   }
 };
 
-// Function to create a database connection
-const createDbConnection = (url: string): Kysely<Database> => {
+const createDbConnection = (url: string, dbName?: string): Kysely<Database> => {
+  const authToken = dbName !== undefined ? dbTokens[dbName] : config.tursoToken;
+  
+  if (!authToken) {
+    throw new Error(`No authentication token found for database: ${dbName}`);
+  }
+  
   return new Kysely<Database>({
     dialect: new LibsqlDialect({
       url,
-      authToken: config.tursoToken,
+      authToken,
     }),
   });
 };
 
-// Function to get or create a database connection for a user
 const getOrCreateDb = async (userId: string): Promise<Kysely<Database>> => {
   if (dbConnections[userId]) {
     return dbConnections[userId];
   }
-
+  
   const dbName = await createChildDatabase(userId);
   const url = `libsql://${dbName}-${config.tursoOrgSlug}.turso.io`;
-  const db = createDbConnection(url);
-
+  const db = createDbConnection(url, dbName);
   dbConnections[userId] = db;
+  
+  // Verify connection works
+  try {
+    const result = await db.selectFrom('message').selectAll().execute();
+    console.log("Connection verified with message count:", result.length);
+  } catch (error) {
+    console.error("Failed to verify database connection:", error);
+    throw error;
+  }
+  
   return db;
 };
 
@@ -143,6 +202,7 @@ export const createExpressApp: Effect.Effect<
   // Initialize with parent database for schema
   const parentDb = createDbConnection(config.tursoUrl);
 
+  // Initialize the parent database schema first
   const server = yield* _(
     Server.pipe(
       Effect.provide(ServerLive),
@@ -150,6 +210,7 @@ export const createExpressApp: Effect.Effect<
     ),
   );
 
+  // Initialize schema in parent database
   yield* _(server.initDatabase);
 
   const app = express();
@@ -165,33 +226,52 @@ export const createExpressApp: Effect.Effect<
       return;
     }
 
-    void getOrCreateDb(userId).then((userDb) => {
-      Effect.runCallback(server.sync(req.body as Uint8Array, socketUserMap), {
-        onExit: Exit.match({
-          onFailure: flow(
-            Cause.failureOrCause,
-            Either.match({
-              onLeft: flow(
-                Match.value,
-                Match.tagsExhaustive({
-                  BadRequestError: ({ error }) => {
-                    res.status(400).send(JSON.stringify(error));
-                  },
-                }),
-              ),
-              onRight: (error) => {
-                // eslint-disable-next-line no-console
-                console.error("server error", error);
-                res.status(500).send("Internal Server Error");
-              },
-            }),
+
+    void getOrCreateDb(userId).then(userDb => {
+      console.log("✅ User DB created - ", userDb.schema);
+    });
+    
+    void getOrCreateDb(userId).then(async (userDb) => {
+      try {
+        // Use the user's database for the sync operation
+        const userServer = await Effect.runPromise(
+          Server.pipe(
+            Effect.provide(ServerLive),
+            Effect.provideService(Db, userDb),
           ),
-          onSuccess: (buffer) => {
-            res.setHeader("Content-Type", "application/x-protobuf");
-            res.send(buffer);
-          },
-        }),
-      });
+        );
+
+        Effect.runCallback(userServer.sync(req.body as Uint8Array, socketUserMap), {
+          onExit: Exit.match({
+            onFailure: flow(
+              Cause.failureOrCause,
+              Either.match({
+                onLeft: flow(
+                  Match.value,
+                  Match.tagsExhaustive({
+                    BadRequestError: ({ error }) => {
+                      res.status(400).send(JSON.stringify(error));
+                    },
+                  }),
+                ),
+                onRight: (error) => {
+                  // eslint-disable-next-line no-console
+                  console.error("server error", error);
+                  res.status(500).send("Internal Server Error");
+                },
+              }),
+            ),
+            onSuccess: (buffer) => {
+              res.setHeader("Content-Type", "application/x-protobuf");
+              res.send(buffer);
+            },
+          }),
+        });
+      } catch (error) {
+        // eslint-disable-next-line no-console
+        console.error("Server initialization error:", error);
+        res.status(500).send("Server initialization error");
+      }
     }).catch((error) => {
       // eslint-disable-next-line no-console
       console.error("Database error:", error);
@@ -216,29 +296,32 @@ export const createExpressAppWithWebsocket = async (
     const wss = new WebSocketServer({ server: httpServer });
 
     wss.on("connection", (ws) => {
-      // Add new client to the list
       clients.push(ws);
-      ws.on("message", (message: WebSocket.RawData) => {
+      
+      ws.on("message", async (message: WebSocket.RawData) => {
         try {
-          // Convert message to JSON if it is not already
-          const json = JSON.parse((message as Buffer).toString("utf-8")) as {
-            channelId: string;
-          };
-          if (json.channelId) {
-            if (socketUserMap[json.channelId] !== undefined)
-              socketUserMap[json.channelId]!.push(ws);
-            else socketUserMap[json.channelId] = [ws];
-            return;
+          // Handle JSON messages (channel registration)
+          if (message instanceof Buffer && message[0] === "{".charCodeAt(0)) {
+            try {
+              const json = JSON.parse(message.toString("utf-8")) as {
+                channelId: string;
+              };
+              if (json.channelId) {
+                if (socketUserMap[json.channelId] !== undefined) {
+                  socketUserMap[json.channelId]!.push(ws);
+                } else {
+                  socketUserMap[json.channelId] = [ws];
+                }
+                return;
+              }
+            } catch (err) {
+              console.error("JSON parsing error:", err);
+              ws.send(JSON.stringify({ error: "Invalid JSON message" }));
+              return;
+            }
           }
-        } catch (err) {
-          // eslint-disable-next-line no-console
-          console.error(
-            "Error handling json request:",
-            (err as Error)?.message || err,
-          );
-        }
-        try {
-          // Convert message to Uint8Array if it is not already
+
+          // Handle binary messages (sync requests)
           let uint8ArrayMessage: Uint8Array;
           if (message instanceof Uint8Array) {
             uint8ArrayMessage = message;
@@ -250,24 +333,67 @@ export const createExpressAppWithWebsocket = async (
             uint8ArrayMessage = new Uint8Array(message);
           }
 
-          Effect.runPromise(server.sync(uint8ArrayMessage, socketUserMap))
-            .then((response) => ws.send(response))
-            .catch((error) => {
-              // eslint-disable-next-line no-console
-              console.error("Error handling sync request:", error);
-
-              ws.send(
-                JSON.stringify({ error: "Failed to process sync request" }),
-              );
+          try {
+            // Validate sync request before processing
+            const request = SyncRequest.fromBinary(uint8ArrayMessage);
+            console.log("WebSocket sync request:", {
+              userId: request.userId,
+              messageCount: request.messages.length
             });
-        } catch (error) {
-          // eslint-disable-next-line no-console
-          console.error("Error handling sync request:", error);
 
-          ws.send(JSON.stringify({ error: "Failed to process sync request" }));
+            const response = await Effect.runPromise(
+              server.sync(uint8ArrayMessage, socketUserMap)
+            );
+            
+            // Validate response before sending
+            if (!(response instanceof Buffer)) {
+              throw new Error("Invalid response type");
+            }
+            
+            ws.send(response);
+          } catch (error) {
+            console.error("Sync processing error:", error);
+            ws.send(JSON.stringify({ 
+              error: "Failed to process sync request",
+              details: error instanceof Error ? error.message : String(error)
+            }));
+          }
+        } catch (error) {
+          console.error("WebSocket message handling error:", error);
+          ws.send(JSON.stringify({ 
+            error: "Failed to handle message",
+            details: error instanceof Error ? error.message : String(error)
+          }));
+        }
+      });
+
+      ws.on("error", (error) => {
+        console.error("WebSocket error:", error);
+      });
+
+      ws.on("close", () => {
+        // Remove from clients array
+        const index = clients.indexOf(ws);
+        if (index > -1) {
+          clients.splice(index, 1);
+        }
+        
+        // Remove from socketUserMap
+        for (const userId in socketUserMap) {
+          const sockets = socketUserMap[userId];
+          if (sockets) {
+            const socketIndex = sockets.indexOf(ws);
+            if (socketIndex > -1) {
+              sockets.splice(socketIndex, 1);
+            }
+            if (sockets.length === 0) {
+              delete socketUserMap[userId];
+            }
+          }
         }
       });
     });
+
 
     const PORT = port || process.env.PORT || 4000;
     httpServer.listen(PORT, () => {
