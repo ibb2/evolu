@@ -83,7 +83,7 @@ const createChildDatabase = async (userId: string) => {
         }
       );
       
-      // If database exists, still need to get a token
+      // If we get here, database exists, get a token and return
       const tokenResponse = await axios.post<TursoTokenResponse>(
         `https://api.turso.tech/v1/organizations/${config.tursoOrgSlug}/databases/${dbName}/auth/tokens`,
         {},
@@ -104,23 +104,30 @@ const createChildDatabase = async (userId: string) => {
       }
       // If 404, continue with creation
     }
-    
+
     // Create child database from parent
-    const createResponse = await axios.post<TursoCreateResponse>(
-      `https://api.turso.tech/v1/organizations/${config.tursoOrgSlug}/databases`,
-      {
-        name: dbName,
-        group: "default",
-        schema: "evolu-parent",
-        location: "syd",
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${config.tursoApiToken}`,
-          "Content-Type": "application/json",
+    try {
+      const createResponse = await axios.post<TursoCreateResponse>(
+        `https://api.turso.tech/v1/organizations/${config.tursoOrgSlug}/databases`,
+        {
+          name: dbName,
+          group: "default",
+          schema: "evolu-parent",
+          location: "syd",
         },
+        {
+          headers: {
+            Authorization: `Bearer ${config.tursoApiToken}`,
+            "Content-Type": "application/json",
+          },
+        }
+      );
+    } catch (createError) {
+      // If database already exists (409), just continue to get token
+      if (!(axios.isAxiosError(createError) && createError.response?.status === 409)) {
+        throw createError;
       }
-    );
+    }
     
     // Wait for database to be ready
     await new Promise(resolve => setTimeout(resolve, 2000));
