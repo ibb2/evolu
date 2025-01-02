@@ -31,9 +31,9 @@ RUN rm -rf /home/node/app/pacakges/evolu-react-native
 
 RUN rm -rf /home/node/app/examples/*
 
-RUN pnpm i --shamefully-hoist
+RUN pnpm install --no-strict-peer-dependencies
 
-RUN pnpm build
+# RUN pnpm build
 
 RUN rm -rf /home/node/app/apps/server/.dockerignore
 
