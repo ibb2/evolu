@@ -1,4 +1,4 @@
-FROM --platform=linux/amd64 node:20-alpine AS builder
+FROM node:20-alpine AS builder
 
 # Set up working directory and environment
 RUN mkdir -p /home/node/app
@@ -16,14 +16,14 @@ COPY . /home/node/app/
 # Remove unnecessary project directories
 RUN rm -rf /home/node/app/apps/native \
     && rm -rf /home/node/app/apps/web \
-    && rm -rf /home/node/app/pacakges/evolu-common-web \
-    && rm -rf /home/node/app/pacakges/evolu-common-react \
-    && rm -rf /home/node/app/pacakges/evolu-react \
-    && rm -rf /home/node/app/pacakges/evolu-react-native \
+    && rm -rf /home/node/app/packages/evolu-common-web \
+    && rm -rf /home/node/app/packages/evolu-common-react \
+    && rm -rf /home/node/app/packages/evolu-react \
+    && rm -rf /home/node/app/packages/evolu-react-native \
     && rm -rf /home/node/app/examples/*
 
 # Install dependencies
-RUN pnpm install --no-strict-peer-dependencies
+RUN pnpm install
 
 # Specific package linking steps
 RUN mkdir -p /home/node/app/packages/evolu-server/node_modules/effect/ \
@@ -73,30 +73,35 @@ RUN mkdir -p /home/node/app/packages/evolu-server/node_modules/effect/ \
     && mkdir -p /home/node/app/packages/evolu-server/node_modules/file-uri-to-path/ \
     && mv /home/node/app/node_modules/file-uri-to-path/* /home/node/app/packages/evolu-server/node_modules/file-uri-to-path/
 
-# Install global express
-RUN npm i -g express
+# Copy necessary packages
+COPY ./packages/evolu-tsconfig /home/node/app/packages/evolu-tsconfig
+COPY . /home/node/app/apps/server
 
-# Remove local express module to avoid conflicts
-RUN rm -rf /home/node/app/packages/evolu-server/node_modules/express
-
-# Copy global express to local express
-RUN cp -r /home/node/.npm-global/lib/node_modules/express /home/node/app/packages/evolu-server/node_modules/
-
-# Copy global express dependencies to local express
-RUN cp -r /home/node/.npm-global/lib/node_modules/express/node_modules/* /home/node/app/packages/evolu-server/node_modules/
-
-FROM --platform=linux/amd64 node:20-alpine
+FROM node:20-alpine
 
 ENV PORT=4000
 
-COPY --from=builder /home/node/app/apps/server /home/node/app/apps/server
-
-COPY --from=builder /home/node/app/packages/evolu-server /home/node/app/packages/evolu-server
-
-COPY --from=builder /home/node/app/packages/evolu-common /home/node/app/packages/evolu-common
-
 WORKDIR /home/node/app/apps/server
 
+COPY --from=builder /home/node/app/apps/server /home/node/app/apps/server
+COPY --from=builder /home/node/app/packages/evolu-server /home/node/app/packages/evolu-server
+COPY --from=builder /home/node/app/packages/evolu-common /home/node/app/packages/evolu-common
+COPY --from=builder /home/node/app/packages/evolu-tsconfig /home/node/app/packages/evolu-tsconfig
+COPY --from=builder /home/node/app/node_modules /home/node/app/node_modules
+
+# Install ts-node and dependencies
+RUN npm install -g ts-node typescript @types/node
+
+# Create a custom tsconfig.json that references the universal-esm config
+RUN echo '{\
+  "extends": "@evolu/tsconfig/universal-esm.json",\
+  "compilerOptions": {\
+    "baseUrl": "."\
+  }\
+}' > /home/node/app/apps/server/tsconfig.json
+
+# Expose the port
 EXPOSE $PORT
 
-CMD [ "npm", "start" ]
+# Use ts-node to run the server with the custom tsconfig
+CMD ["ts-node", "-P", "/home/node/app/apps/server/tsconfig.json", "src/index.ts"]

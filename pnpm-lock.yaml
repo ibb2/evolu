@@ -7,11 +7,6 @@ settings:
 overrides:
   flexsearch: 0.7.31
 
-patchedDependencies:
-  '@changesets/assemble-release-plan@6.0.4':
-    hash: ay6m5xdoyblaotspw5mcyhbgiq
-    path: patches/@changesets__assemble-release-plan@6.0.4.patch
-
 importers:
 
   .:
@@ -11812,7 +11807,7 @@ snapshots:
       resolve-from: 5.0.0
       semver: 7.6.3
 
-  '@changesets/assemble-release-plan@6.0.4(patch_hash=ay6m5xdoyblaotspw5mcyhbgiq)':
+  '@changesets/assemble-release-plan@6.0.4':
     dependencies:
       '@changesets/errors': 0.2.0
       '@changesets/get-dependents-graph': 2.1.2
@@ -11828,7 +11823,7 @@ snapshots:
   '@changesets/cli@2.27.9':
     dependencies:
       '@changesets/apply-release-plan': 7.0.5
-      '@changesets/assemble-release-plan': 6.0.4(patch_hash=ay6m5xdoyblaotspw5mcyhbgiq)
+      '@changesets/assemble-release-plan': 6.0.4
       '@changesets/changelog-git': 0.2.0
       '@changesets/config': 3.0.3
       '@changesets/errors': 0.2.0
@@ -11879,7 +11874,7 @@ snapshots:
 
   '@changesets/get-release-plan@4.0.4':
     dependencies:
-      '@changesets/assemble-release-plan': 6.0.4(patch_hash=ay6m5xdoyblaotspw5mcyhbgiq)
+      '@changesets/assemble-release-plan': 6.0.4
       '@changesets/config': 3.0.3
       '@changesets/pre': 2.0.1
       '@changesets/read': 0.6.1
