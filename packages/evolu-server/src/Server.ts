@@ -139,38 +139,102 @@ export const ServerLive = Layer.effect(
                 }),
             ),
           );
+          const currentMerkleTreeString = merkleTreeToString(merkleTree);
+          
+          // Get all messages first to see what's available
+          const allMessages = yield* _(
+            Effect.promise(() =>
+              db
+                .selectFrom("message")
+                .select(["timestamp", "content"])
+                .where("userId", "=", request.userId)
+                .orderBy("timestamp")
+                .execute(),
+            ),
+          );
+
+          yield* _(
+            Effect.logDebug([
+              "All available messages",
+              {
+                count: allMessages.length,
+                timestamps: allMessages.map(m => m.timestamp),
+              },
+            ]),
+          );
+
+          // Get messages that need syncing
           const messages = yield* _(
-            diffMerkleTrees(
-              merkleTree,
-              unsafeMerkleTreeFromString(request.merkleTree),
+            diffMerkleTrees(merkleTree, unsafeMerkleTreeFromString(request.merkleTree)),
+            Effect.tap((diff) =>
+              Effect.logDebug([
+                "Merkle tree diff",
+                { 
+                  diff,
+                  currentTree: merkleTreeToString(merkleTree),
+                  requestTree: request.merkleTree,
+                },
+              ]),
             ),
             Effect.map(makeSyncTimestamp),
             Effect.map(timestampToString),
+            Effect.tap((timestamp) =>
+              Effect.logDebug([
+                "Sync timestamp",
+                { timestamp },
+              ]),
+            ),
             Effect.flatMap((timestamp) =>
-              Effect.promise(() =>
-                db
+              Effect.promise(() => {
+                // Check if this is an initial sync (empty merkle tree)
+                const isInitialSync = request.merkleTree === merkleTreeToString(initialMerkleTree);
+                
+                return db
                   .selectFrom("message")
                   .select(["timestamp", "content"])
                   .where("userId", "=", request.userId)
                   .where("timestamp", ">=", timestamp)
-                  .where(
-                    "timestamp",
-                    "not like",
-                    sql<TimestampString>`'%' || ${request.nodeId}`,
-                  )
                   .orderBy("timestamp")
-                  .execute(),
-              ),
+                  // Use higher limit for initial sync
+                  .limit(isInitialSync ? 1000 : 50)
+                  .execute();
+              }),
             ),
-            Effect.orElseSucceed(() => []),
+            Effect.map((msgs) => 
+              msgs.map(msg => ({
+                timestamp: msg.timestamp,
+                content: msg.content instanceof Uint8Array ? msg.content : new Uint8Array(msg.content),
+              }))
+            ),
+            Effect.tap((msgs) =>
+              Effect.logDebug([
+                "Messages selected for sync",
+                {
+                  count: msgs.length,
+                  timestamps: msgs.map(m => m.timestamp),
+                  isInitialSync: request.merkleTree === merkleTreeToString(initialMerkleTree),
+                },
+              ]),
+            ),
+            Effect.catchAll(() => Effect.succeed([])),
           );
 
-          const response = SyncResponse.toBinary({
-            merkleTree: merkleTreeToString(merkleTree),
+          const syncResponse = {
+            merkleTree: currentMerkleTreeString,
             messages,
-          });
+          };
 
-          return Buffer.from(response);
+          try {
+            const response = SyncResponse.toBinary(syncResponse);
+            return Buffer.from(response);
+          } catch (error) {
+            return yield* _(
+              Effect.fail({
+                _tag: "BadRequestError" as const,
+                error: new Error(`Serialization failed: ${error}`),
+              }),
+            );
+          }
         }),
     });
   }),

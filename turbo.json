@@ -2,7 +2,12 @@
   "$schema": "https://turborepo.org/schema.json",
   "globalEnv": [
     "NODE_ENV",
-    "PORT"
+    "PORT",
+    "TURSO_URL",
+    "TURSO_TOKEN",
+    "TURSO_ORG_SLUG",
+    "TURSO_PARENT_DB",
+    "TURSO_API_TOKEN"
   ],
   "tasks": {
     "build": {
