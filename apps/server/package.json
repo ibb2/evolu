@@ -11,6 +11,7 @@
     "clean": "rm -rf .turbo node_modules dist db.sqlite"
   },
   "dependencies": {
+    "@effect/platform-node": "^0.68.1",
     "@evolu/server": "workspace:*",
     "dotenv": "^16.4.7"
   },

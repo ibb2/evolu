@@ -70,17 +70,12 @@ type PlanType = keyof typeof PLAN_LIMITS;
 const getDatabaseSize = async (dbName: string): Promise<number> => {
   try {
     const db: DatabaseUsage = await turso.databases.usage(dbName);
-
     if (db.instances.length === 0) {
       throw new Error('Invalid auth database response');
     }
-
     return db.usage.storage_bytes / (1024 * 1024 * 1024);
   } catch (err) {
-    if (err instanceof Error) {
-      Effect.logError("Error getting database size", { error: err.message });
-      throw new Error(`Failed to get database size: ${err.message}`);
-    }
+    console.error("Error getting database size:", err instanceof Error ? err.message : String(err));
     throw err;
   }
 };
@@ -88,17 +83,14 @@ const getDatabaseSize = async (dbName: string): Promise<number> => {
 // Function to get user's subscription plan
 const getUserSubscriptionPlan = async (userId: string): Promise<PlanType> => {
   try {
-    // Get user from auth database
     const authDb = await turso.databases.get(config.tursoParentDb);
-
     const client = createClient({
       url: `libsql://${authDb.hostname}`,
       authToken: config.tursoToken,
     });
 
-    // Get user by evoluId
     const result = await client.execute({
-      sql: "SELECT stripeCustomerId FROM users WHERE evoluId = ?",
+      sql: "SELECT stripeCustomerId FROM user WHERE evoluId = ?",
       args: [userId],
     });
 
@@ -108,7 +100,6 @@ const getUserSubscriptionPlan = async (userId: string): Promise<PlanType> => {
     }
 
     try {
-      // Get customer's subscription from Stripe
       const customerResponse = await stripe.customers.retrieve(stripeCustomerId, {
         expand: ['subscriptions'],
       });
@@ -123,22 +114,15 @@ const getUserSubscriptionPlan = async (userId: string): Promise<PlanType> => {
       }
 
       const planName = subscription.items.data[0].price.nickname.toLowerCase();
-      if (planName.includes('pro')) {
-        return 'pro';
-      } else if (planName.includes('plus')) {
-        return 'plus';
-      }
+      if (planName.includes('pro')) return 'pro';
+      if (planName.includes('plus')) return 'plus';
     } catch (err) {
-      if (err instanceof Error) {
-        Effect.logError("Error getting Stripe subscription", { error: err.message });
-      }
+      console.error("Error getting Stripe subscription:", err instanceof Error ? err.message : String(err));
     }
     
     return 'basic';
   } catch (err) {
-    if (err instanceof Error) {
-      Effect.logError("Error getting subscription plan", { error: err.message });
-    }
+    console.error("Error getting subscription plan:", err instanceof Error ? err.message : String(err));
     return 'basic';
   }
 };
@@ -154,10 +138,7 @@ const canUserSync = async (userId: string, dbName: string): Promise<boolean> => 
     const sizeLimit = PLAN_LIMITS[plan];
     return dbSize < sizeLimit;
   } catch (err) {
-    if (err instanceof Error) {
-      Effect.logError("Error checking sync eligibility", { error: err.message });
-      throw new Error(`Failed to check sync eligibility: ${err.message}`);
-    }
+    console.error("Error checking sync eligibility:", err instanceof Error ? err.message : String(err));
     throw err;
   }
 };
@@ -331,7 +312,7 @@ export const createExpressApp: Effect.Effect<
   app.use(cors());
   app.use(bodyParser.raw({ limit: "20mb", type: "application/x-protobuf" }));
 
-  app.post("/", (req, res) => {
+  app.post("/", async (req, res) => {
     const request = SyncRequest.fromBinary(req.body as Uint8Array);
     const userId = request.userId;
 
@@ -343,8 +324,12 @@ export const createExpressApp: Effect.Effect<
     const sanitizedUserId = userId.toLowerCase().replace(/[^a-z0-9-]/g, '-');
     const dbName = `evolu-${sanitizedUserId}`;
 
-    canUserSync(userId, dbName).then(async (canSync) => {
+    try {
+      const userDb = await getOrCreateDb(userId);
+      const canSync = await canUserSync(userId, dbName);
+      
       if (!canSync) {
+        console.error(`Sync rejected: User ${userId} exceeded database size limit`);
         res.status(402).send(JSON.stringify({
           _tag: "SyncStateIsNotSynced",
           error: { _tag: "PaymentRequiredError" }
@@ -352,61 +337,50 @@ export const createExpressApp: Effect.Effect<
         return;
       }
 
-      try {
-        const userDb = await getOrCreateDb(userId);
-        Effect.logDebug("User DB created", { schema: userDb.schema });
-        
-        const userServer = await Effect.runPromise(
-          Server.pipe(
-            Effect.provide(ServerLive),
-            Effect.provideService(Db, userDb),
-          ),
-        );
+      const userServer = await Effect.runPromise(
+        Server.pipe(
+          Effect.provide(ServerLive),
+          Effect.provideService(Db, userDb),
+        ),
+      );
 
-        Effect.runCallback(userServer.sync(req.body as Uint8Array, socketUserMap), {
-          onExit: Exit.match({
-            onFailure: flow(
-              Cause.failureOrCause,
-              Either.match({
-                onLeft: flow(
-                  Match.value,
-                  Match.tagsExhaustive({
-                    BadRequestError: ({ error }) => {
-                      res.status(400).send(JSON.stringify(error));
-                    },
-                  }),
-                ),
-                onRight: (error) => {
-                  Effect.logError("Server error", { error });
-                  res.status(500).send(JSON.stringify({
-                    _tag: "SyncStateIsNotSynced",
-                    error: { _tag: "ServerError", status: 500 }
-                  }));
-                },
-              }),
-            ),
-            onSuccess: (buffer) => {
-              res.setHeader("Content-Type", "application/x-protobuf");
-              res.send(buffer);
-            },
-          }),
-        });
-      } catch (err) {
-        const error = err as Error;
-        Effect.logError("Server initialization error", { error: error.message });
-        res.status(500).send(JSON.stringify({
-          _tag: "SyncStateIsNotSynced",
-          error: { _tag: "ServerError", status: 500 }
-        }));
-      }
-    }).catch((err) => {
+      Effect.runCallback(userServer.sync(req.body as Uint8Array, socketUserMap), {
+        onExit: Exit.match({
+          onFailure: flow(
+            Cause.failureOrCause,
+            Either.match({
+              onLeft: flow(
+                Match.value,
+                Match.tagsExhaustive({
+                  BadRequestError: ({ error }) => {
+                    console.error(`Sync error for user ${userId}:`, error);
+                    res.status(400).send(JSON.stringify(error));
+                  },
+                }),
+              ),
+              onRight: (error) => {
+                console.error(`Server error during sync for user ${userId}:`, error);
+                res.status(500).send(JSON.stringify({
+                  _tag: "SyncStateIsNotSynced",
+                  error: { _tag: "ServerError", status: 500 }
+                }));
+              },
+            }),
+          ),
+          onSuccess: (buffer) => {
+            res.setHeader("Content-Type", "application/x-protobuf");
+            res.send(buffer);
+          },
+        }),
+      });
+    } catch (err) {
       const error = err as Error;
-      Effect.logError("Subscription check error", { error: error.message });
+      console.error(`Server initialization error for user ${userId}:`, error.message);
       res.status(500).send(JSON.stringify({
         _tag: "SyncStateIsNotSynced",
         error: { _tag: "ServerError", status: 500 }
       }));
-    });
+    }
   });
 
   return { app, server };
@@ -446,7 +420,7 @@ export const createExpressAppWithWebsocket = async (
               }
             } catch (err) {
               const error = err as Error;
-              Effect.logError("JSON parsing error", { error: error.message });
+              console.error("JSON parsing error", { error: error.message });
               ws.send(JSON.stringify({ error: "Invalid JSON message" }));
               return;
             }
@@ -467,7 +441,7 @@ export const createExpressAppWithWebsocket = async (
           try {
             // Validate sync request before processing
             const request = SyncRequest.fromBinary(uint8ArrayMessage);
-            Effect.logDebug("WebSocket sync request", {
+            console.log("WebSocket sync request", {
               userId: request.userId,
               messageCount: request.messages.length
             });
@@ -483,7 +457,7 @@ export const createExpressAppWithWebsocket = async (
               ws.send(response);
             }).catch((err) => {
               const error = err as Error;
-              Effect.logError("Sync processing error", { error: error.message });
+              console.error("Sync processing error", { error: error.message });
               ws.send(JSON.stringify({ 
                 error: "Failed to process sync request",
                 details: error.message
@@ -491,7 +465,7 @@ export const createExpressAppWithWebsocket = async (
             });
           } catch (err) {
             const error = err as Error;
-            Effect.logError("WebSocket message handling error", { error: error.message });
+            console.error("WebSocket message handling error", { error: error.message });
             ws.send(JSON.stringify({ 
               error: "Failed to handle message",
               details: error.message
@@ -499,7 +473,7 @@ export const createExpressAppWithWebsocket = async (
           }
         } catch (err) {
           const error = err as Error;
-          Effect.logError("WebSocket error", { error: error.message });
+          console.error("WebSocket error", { error: error.message });
           ws.send(JSON.stringify({ 
             error: "Failed to handle message",
             details: error.message
@@ -509,7 +483,7 @@ export const createExpressAppWithWebsocket = async (
 
       ws.on("error", (err) => {
         const error = err as Error;
-        Effect.logError("WebSocket error", { error: error.message });
+        console.error("WebSocket error", { error: error.message });
       });
 
       ws.on("close", () => {
@@ -537,12 +511,12 @@ export const createExpressAppWithWebsocket = async (
 
     const PORT = port || process.env.PORT || 4000;
     httpServer.listen(PORT, () => {
-      Effect.logDebug("HTTP and WebSocket server started", { port: PORT });
+      console.log("HTTP and WebSocket server started", { port: PORT });
     });
     return { app, server, wss };
   } catch (err) {
     const error = err as Error;
-    Effect.logError("Failed to start the server", { error: error.message });
+    console.error("Failed to start the server", { error: error.message });
     throw error;
   }
   return undefined;
