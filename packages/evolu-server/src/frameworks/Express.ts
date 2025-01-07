@@ -276,7 +276,13 @@ const getOrCreateDb = async (userId: string): Promise<Kysely<Database>> => {
     }
     return db;
 };
-export const createExpressApp = Effect.gen(function* (_) {
+
+export interface ExpressApp {
+    app: express.Express;
+    server: Server;
+}
+
+export const createExpressApp: Effect.Effect<ExpressApp> = Effect.gen(function* (_) {
     // Initialize with parent database for schema
     const parentDb = createDbConnection(config.tursoUrl);
     // Initialize the parent database schema first
@@ -361,7 +367,7 @@ export const createExpressApp = Effect.gen(function* (_) {
         })();
     });
     return { app, server };
-});
+}).pipe(Effect.provideService(Db, createDbConnection(config.tursoUrl)));
 // Main startup function
 export const createExpressAppWithWebsocket = async (port?: number): Promise<{ app: express.Express; server: Server; wss: WebSocketServer } | undefined> => {
     try {
