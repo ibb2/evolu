@@ -1,14 +1,25 @@
-[build]
-builder = "nixpacks"
-buildCommand = """
-curl -f https://get.pnpm.io/v6.16.js | node - add --global pnpm
-cd apps/server
-pnpm install
-pnpm run build
-"""
-
-[deploy]
-startCommand = "pnpm start"
-healthcheckPath = "/"
-healthcheckTimeout = 100
-restartPolicyType = "never"
+services:
+  - type: web
+    name: evolu-server
+    env: node
+    buildCommand: |
+      curl -f https://get.pnpm.io/v6.16.js | node - add --global pnpm
+      cd apps/server
+      pnpm install
+      pnpm run build
+    startCommand: cd apps/server && pnpm start
+    envVars:
+      - key: PORT
+        value: 4000
+      - key: TURSO_URL
+        sync: false
+      - key: TURSO_TOKEN
+        sync: false
+      - key: TURSO_ORG_SLUG
+        sync: false
+      - key: TURSO_PARENT_DB
+        sync: false
+      - key: TURSO_API_TOKEN
+        sync: false
+      - key: STRIPE_SECRET_KEY
+        sync: false
