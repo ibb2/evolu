@@ -30,6 +30,7 @@
     "@evolu/common": "workspace:*",
     "@libsql/client": "^0.14.0",
     "@libsql/kysely-libsql": "^0.4.1",
+    "@tursodatabase/api": "^1.9.0",
     "axios": "^1.7.9",
     "better-sqlite3": "^11.0.0",
     "body-parser": "^1.20.2",
@@ -37,6 +38,7 @@
     "effect": "3.10.4",
     "express": "^4.19.2",
     "kysely": "^0.27.3",
+    "stripe": "^17.5.0",
     "ws": "^8.18.0"
   },
   "devDependencies": {

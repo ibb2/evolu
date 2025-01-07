@@ -1,5 +1,8 @@
+/* eslint-disable @typescript-eslint/no-unsafe-member-access */
+/* eslint-disable @typescript-eslint/no-unsafe-call */
+/* eslint-disable @typescript-eslint/no-unsafe-assignment */
 import { createClient } from "@libsql/client";
-import axios from "axios";
+import axios, { AxiosError } from "axios";
 import bodyParser from "body-parser";
 import cors from "cors";
 import * as Cause from "effect/Cause";
@@ -16,29 +19,15 @@ import { Database, Db } from "../Types.js";
 import { createServer } from "http";
 import WebSocket, { WebSocketServer } from "ws";
 import { SyncRequest } from "@evolu/common";
+import { Logger } from "effect/Logger";
+import Stripe from "stripe";
+import { createClient as createTursoClient } from "@tursodatabase/api";
+import type { DatabaseUsage, Database as TursoDatabase } from "@tursodatabase/api";
 
-// Turso API types
-interface TursoDatabase {
-  DbId: string;
-  Name: string;
-  Hostname: string;
-}
-
-interface TursoApiResponse {
-  database: TursoDatabase;
-}
-
-interface TursoTokenResponse {
-  jwt: string;
-}
-
-interface TursoCreateResponse {
-  database: {
-    DbId: string;
-    Hostname: string;
-    Name: string;
-  };
-}
+// Type guard for Stripe Customer
+const isStripeCustomer = (customer: unknown): customer is Stripe.Customer => {
+  return typeof customer === 'object' && customer !== null && !('deleted' in customer);
+};
 
 // Environment variables validation
 const getRequiredEnvVar = (name: string): string => {
@@ -53,7 +42,125 @@ const config = {
   tursoOrgSlug: getRequiredEnvVar("TURSO_ORG_SLUG"),
   tursoParentDb: getRequiredEnvVar("TURSO_PARENT_DB"),
   tursoApiToken: getRequiredEnvVar("TURSO_API_TOKEN"),
+  stripeSecretKey: getRequiredEnvVar("STRIPE_SECRET_KEY"),
 } as const;
+
+// Initialize Stripe
+const stripe = new Stripe(config.stripeSecretKey, {
+  apiVersion: '2024-12-18.acacia',
+  typescript: true,
+});
+
+// Initialize Turso auth client
+const turso = createTursoClient({
+  org: "ibb2",
+  token: config.tursoApiToken,
+});
+
+// Plan limits in GB
+const PLAN_LIMITS = {
+  basic: 0.5,
+  plus: 2,
+  pro: 10,
+} as const;
+
+type PlanType = keyof typeof PLAN_LIMITS;
+
+// Function to get database size in GB
+const getDatabaseSize = async (dbName: string): Promise<number> => {
+  try {
+    const db: DatabaseUsage = await turso.databases.usage(dbName);
+
+    if (db.instances.length === 0) {
+      throw new Error('Invalid auth database response');
+    }
+
+    return db.usage.storage_bytes / (1024 * 1024 * 1024);
+  } catch (err) {
+    if (err instanceof Error) {
+      Effect.logError("Error getting database size", { error: err.message });
+      throw new Error(`Failed to get database size: ${err.message}`);
+    }
+    throw err;
+  }
+};
+
+// Function to get user's subscription plan
+const getUserSubscriptionPlan = async (userId: string): Promise<PlanType> => {
+  try {
+    // Get user from auth database
+    const authDb = await turso.databases.get(config.tursoParentDb);
+
+    const client = createClient({
+      url: `libsql://${authDb.hostname}`,
+      authToken: config.tursoToken,
+    });
+
+    // Get user by evoluId
+    const result = await client.execute({
+      sql: "SELECT stripeCustomerId FROM users WHERE evoluId = ?",
+      args: [userId],
+    });
+
+    const stripeCustomerId = result.rows?.[0]?.stripeCustomerId;
+    if (!stripeCustomerId || typeof stripeCustomerId !== 'string') {
+      return 'basic';
+    }
+
+    try {
+      // Get customer's subscription from Stripe
+      const customerResponse = await stripe.customers.retrieve(stripeCustomerId, {
+        expand: ['subscriptions'],
+      });
+
+      if (!isStripeCustomer(customerResponse)) {
+        return 'basic';
+      }
+
+      const subscription = customerResponse.subscriptions?.data[0];
+      if (!subscription?.items.data[0]?.price.nickname) {
+        return 'basic';
+      }
+
+      const planName = subscription.items.data[0].price.nickname.toLowerCase();
+      if (planName.includes('pro')) {
+        return 'pro';
+      } else if (planName.includes('plus')) {
+        return 'plus';
+      }
+    } catch (err) {
+      if (err instanceof Error) {
+        Effect.logError("Error getting Stripe subscription", { error: err.message });
+      }
+    }
+    
+    return 'basic';
+  } catch (err) {
+    if (err instanceof Error) {
+      Effect.logError("Error getting subscription plan", { error: err.message });
+    }
+    return 'basic';
+  }
+};
+
+// Function to check if user can sync based on their plan and database size
+const canUserSync = async (userId: string, dbName: string): Promise<boolean> => {
+  try {
+    const [plan, dbSize] = await Promise.all([
+      getUserSubscriptionPlan(userId),
+      getDatabaseSize(dbName),
+    ]);
+
+    const sizeLimit = PLAN_LIMITS[plan];
+    return dbSize < sizeLimit;
+  } catch (err) {
+    if (err instanceof Error) {
+      Effect.logError("Error checking sync eligibility", { error: err.message });
+      throw new Error(`Failed to check sync eligibility: ${err.message}`);
+    }
+    throw err;
+  }
+};
 
 // Array to keep track of connected WebSocket clients
 const clients: WebSocket[] = [];
@@ -73,7 +180,7 @@ const createChildDatabase = async (userId: string) => {
   try {
     // First, check if the database already exists
     try {
-      const checkDbResponse = await axios.get<TursoApiResponse>(
+      const checkDbResponse = await axios.get(
         `https://api.turso.tech/v1/organizations/${config.tursoOrgSlug}/databases/${dbName}`,
         {
           headers: {
@@ -84,7 +191,7 @@ const createChildDatabase = async (userId: string) => {
       );
       
       // If we get here, database exists, get a token and return
-      const tokenResponse = await axios.post<TursoTokenResponse>(
+      const tokenResponse = await axios.post(
         `https://api.turso.tech/v1/organizations/${config.tursoOrgSlug}/databases/${dbName}/auth/tokens`,
         {},
         {
@@ -107,7 +214,7 @@ const createChildDatabase = async (userId: string) => {
 
     // Create child database from parent
     try {
-      const createResponse = await axios.post<TursoCreateResponse>(
+      const createResponse = await axios.post(
         `https://api.turso.tech/v1/organizations/${config.tursoOrgSlug}/databases`,
         {
           name: dbName,
@@ -133,7 +240,7 @@ const createChildDatabase = async (userId: string) => {
     await new Promise(resolve => setTimeout(resolve, 2000));
     
     // Get a new auth token for the child database
-    const tokenResponse = await axios.post<TursoTokenResponse>(
+    const tokenResponse = await axios.post(
       `https://api.turso.tech/v1/organizations/${config.tursoOrgSlug}/databases/${dbName}/auth/tokens`,
       {},
       {
@@ -233,14 +340,22 @@ export const createExpressApp: Effect.Effect<
       return;
     }
 
+    const sanitizedUserId = userId.toLowerCase().replace(/[^a-z0-9-]/g, '-');
+    const dbName = `evolu-${sanitizedUserId}`;
 
-    void getOrCreateDb(userId).then(userDb => {
-      console.log("✅ User DB created - ", userDb.schema);
-    });
-    
-    void getOrCreateDb(userId).then(async (userDb) => {
+    canUserSync(userId, dbName).then(async (canSync) => {
+      if (!canSync) {
+        res.status(402).send(JSON.stringify({
+          _tag: "SyncStateIsNotSynced",
+          error: { _tag: "PaymentRequiredError" }
+        }));
+        return;
+      }
+
       try {
-        // Use the user's database for the sync operation
+        const userDb = await getOrCreateDb(userId);
+        Effect.logDebug("User DB created", { schema: userDb.schema });
+        
         const userServer = await Effect.runPromise(
           Server.pipe(
             Effect.provide(ServerLive),
@@ -262,9 +377,11 @@ export const createExpressApp: Effect.Effect<
                   }),
                 ),
                 onRight: (error) => {
-                  // eslint-disable-next-line no-console
-                  console.error("server error", error);
-                  res.status(500).send("Internal Server Error");
+                  Effect.logError("Server error", { error });
+                  res.status(500).send(JSON.stringify({
+                    _tag: "SyncStateIsNotSynced",
+                    error: { _tag: "ServerError", status: 500 }
+                  }));
                 },
               }),
             ),
@@ -274,15 +391,21 @@ export const createExpressApp: Effect.Effect<
             },
           }),
         });
-      } catch (error) {
-        // eslint-disable-next-line no-console
-        console.error("Server initialization error:", error);
-        res.status(500).send("Server initialization error");
+      } catch (err) {
+        const error = err as Error;
+        Effect.logError("Server initialization error", { error: error.message });
+        res.status(500).send(JSON.stringify({
+          _tag: "SyncStateIsNotSynced",
+          error: { _tag: "ServerError", status: 500 }
+        }));
       }
-    }).catch((error) => {
-      // eslint-disable-next-line no-console
-      console.error("Database error:", error);
-      res.status(500).send("Database error");
+    }).catch((err) => {
+      const error = err as Error;
+      Effect.logError("Subscription check error", { error: error.message });
+      res.status(500).send(JSON.stringify({
+        _tag: "SyncStateIsNotSynced",
+        error: { _tag: "ServerError", status: 500 }
+      }));
     });
   });
 
@@ -305,7 +428,7 @@ export const createExpressAppWithWebsocket = async (
     wss.on("connection", (ws) => {
       clients.push(ws);
       
-      ws.on("message", async (message: WebSocket.RawData) => {
+      ws.on("message", (message: WebSocket.RawData) => {
         try {
           // Handle JSON messages (channel registration)
           if (message instanceof Buffer && message[0] === "{".charCodeAt(0)) {
@@ -322,7 +445,8 @@ export const createExpressAppWithWebsocket = async (
                 return;
               }
             } catch (err) {
-              console.error("JSON parsing error:", err);
+              const error = err as Error;
+              Effect.logError("JSON parsing error", { error: error.message });
               ws.send(JSON.stringify({ error: "Invalid JSON message" }));
               return;
             }
@@ -343,39 +467,49 @@ export const createExpressAppWithWebsocket = async (
           try {
             // Validate sync request before processing
             const request = SyncRequest.fromBinary(uint8ArrayMessage);
-            console.log("WebSocket sync request:", {
+            Effect.logDebug("WebSocket sync request", {
               userId: request.userId,
               messageCount: request.messages.length
             });
 
-            const response = await Effect.runPromise(
+            void Effect.runPromise(
               server.sync(uint8ArrayMessage, socketUserMap)
-            );
-            
-            // Validate response before sending
-            if (!(response instanceof Buffer)) {
-              throw new Error("Invalid response type");
-            }
-            
-            ws.send(response);
-          } catch (error) {
-            console.error("Sync processing error:", error);
+            ).then((response) => {
+              // Validate response before sending
+              if (!(response instanceof Buffer)) {
+                throw new Error("Invalid response type");
+              }
+              
+              ws.send(response);
+            }).catch((err) => {
+              const error = err as Error;
+              Effect.logError("Sync processing error", { error: error.message });
+              ws.send(JSON.stringify({ 
+                error: "Failed to process sync request",
+                details: error.message
+              }));
+            });
+          } catch (err) {
+            const error = err as Error;
+            Effect.logError("WebSocket message handling error", { error: error.message });
             ws.send(JSON.stringify({ 
-              error: "Failed to process sync request",
-              details: error instanceof Error ? error.message : String(error)
+              error: "Failed to handle message",
+              details: error.message
             }));
           }
-        } catch (error) {
-          console.error("WebSocket message handling error:", error);
+        } catch (err) {
+          const error = err as Error;
+          Effect.logError("WebSocket error", { error: error.message });
           ws.send(JSON.stringify({ 
             error: "Failed to handle message",
-            details: error instanceof Error ? error.message : String(error)
+            details: error.message
           }));
         }
       });
 
-      ws.on("error", (error) => {
-        console.error("WebSocket error:", error);
+      ws.on("error", (err) => {
+        const error = err as Error;
+        Effect.logError("WebSocket error", { error: error.message });
       });
 
       ws.on("close", () => {
@@ -401,18 +535,14 @@ export const createExpressAppWithWebsocket = async (
       });
     });
 
-
     const PORT = port || process.env.PORT || 4000;
     httpServer.listen(PORT, () => {
-      // eslint-disable-next-line no-console
-      console.log(
-        `HTTP and WebSocket server started on http://localhost:${PORT}`,
-      );
+      Effect.logDebug("HTTP and WebSocket server started", { port: PORT });
     });
     return { app, server, wss };
-  } catch (error) {
-    // eslint-disable-next-line no-console
-    console.error("Failed to start the server:", error);
+  } catch (err) {
+    const error = err as Error;
+    Effect.logError("Failed to start the server", { error: error.message });
     throw error;
   }
   return undefined;
