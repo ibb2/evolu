@@ -1,6 +1,11 @@
 [build]
 builder = "nixpacks"
-buildCommand = "curl -f https://get.pnpm.io/v6.16.js | node - add --global pnpm && cd apps/server && pnpm install && pnpm run build"
+buildCommand = """
+curl -f https://get.pnpm.io/v6.16.js | node - add --global pnpm && \
+cd apps/server && \
+pnpm install --no-frozen-lockfile && \
+pnpm run build
+"""
 
 [deploy]
 startCommand = "cd apps/server && pnpm start"
@@ -9,4 +14,4 @@ healthcheckTimeout = 100
 
 [variables]
 PORT = "4000"
-NODE_ENV = "production"
+NODE_VERSION = "20"
