@@ -1,0 +1,6 @@
+{
+  "databaseURL": "https://ib-s-workspace-cld7v9.us-east-1.xata.sh/db/aether",
+  "codegen": {
+    "output": "src/xata.ts"
+  }
+}

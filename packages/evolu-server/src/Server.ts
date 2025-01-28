@@ -28,6 +28,7 @@ export interface Server {
     socketUserMap: { [key: string]: WebSocket[] | undefined },
   ) => Effect.Effect<Buffer, BadRequestError>;
 }
+
 const broadcastByMap = (
   data: ArrayBufferLike,
   socketUserMap: { [key: string]: WebSocket[] | undefined },
@@ -52,17 +53,37 @@ export const ServerLive = Layer.effect(
         await db.schema
           .createTable("message")
           .ifNotExists()
+          .addColumn("xata_id", "text", (col) =>
+            col.defaultTo(sql`'rec_' || (xata_private.xid())::text`),
+          ) // Xata ID
           .addColumn("timestamp", "text")
           .addColumn("userId", "text")
-          .addColumn("content", "blob")
-          .addPrimaryKeyConstraint("messagePrimaryKey", ["timestamp", "userId"])
+          .addColumn("content", "bytea") // Store JSON data in JSONB for better performance
+          .addColumn("xata_createdat", "timestamptz", (col) =>
+            col.defaultTo(sql`now()`),
+          ) // Timestamp for creation
+          .addColumn("xata_updatedat", "timestamptz", (col) =>
+            col.defaultTo(sql`now()`),
+          ) // Timestamp for updates
+          .addColumn("xata_version", "integer", (col) => col.defaultTo(0)) // Version field (defaults to 0)
+          .addPrimaryKeyConstraint("messagePrimaryKey", ["timestamp", "userId"]) // Composite key
           .execute();
 
         await db.schema
           .createTable("merkleTree")
           .ifNotExists()
-          .addColumn("userId", "text", (col) => col.primaryKey())
+          .addColumn("xata_id", "text", (col) =>
+            col.defaultTo(sql`'rec_' || (xata_private.xid())::text`),
+          ) // Xata ID
+          .addColumn("userId", "text", (col) => col.primaryKey()) // userId is part of the primary key
           .addColumn("merkleTree", "text")
+          .addColumn("xata_createdat", "timestamptz", (col) =>
+            col.defaultTo(sql`now()`),
+          ) // Timestamp for creation
+          .addColumn("xata_updatedat", "timestamptz", (col) =>
+            col.defaultTo(sql`now()`),
+          ) // Timestamp for updates
+          .addColumn("xata_version", "integer", (col) => col.defaultTo(0)) // Version field (defaults to 0)
           .execute();
 
         await db.schema
@@ -84,6 +105,8 @@ export const ServerLive = Layer.effect(
               }),
             }),
           );
+
+
           broadcastByMap(body, socketUserMap, request.userId);
           const merkleTree = yield* _(
             Effect.promise(() =>
@@ -104,6 +127,7 @@ export const ServerLive = Layer.effect(
                   if (request.messages.length === 0) return merkleTree;
 
                   for (const message of request.messages) {
+                    console.log("Inserting message", message);
                     const { numInsertedOrUpdatedRows } = await trx
                       .insertInto("message")
                       .values({
@@ -131,7 +155,7 @@ export const ServerLive = Layer.effect(
                       merkleTree: merkleTreeString,
                     })
                     .onConflict((oc) =>
-                      oc.doUpdateSet({ merkleTree: merkleTreeString }),
+                      oc.column('userId').doUpdateSet({ merkleTree: merkleTreeString }),
                     )
                     .execute();
 
@@ -139,8 +163,9 @@ export const ServerLive = Layer.effect(
                 }),
             ),
           );
+
           const currentMerkleTreeString = merkleTreeToString(merkleTree);
-          
+
           // Get all messages first to see what's available
           const allMessages = yield* _(
             Effect.promise(() =>
@@ -158,18 +183,22 @@ export const ServerLive = Layer.effect(
               "All available messages",
               {
                 count: allMessages.length,
-                timestamps: allMessages.map(m => m.timestamp),
+                timestamps: allMessages.map((m) => m.timestamp),
               },
             ]),
           );
 
           // Get messages that need syncing
+
           const messages = yield* _(
-            diffMerkleTrees(merkleTree, unsafeMerkleTreeFromString(request.merkleTree)),
+            diffMerkleTrees(
+              merkleTree,
+              unsafeMerkleTreeFromString(request.merkleTree),
+            ),
             Effect.tap((diff) =>
               Effect.logDebug([
                 "Merkle tree diff",
-                { 
+                {
                   diff,
                   currentTree: merkleTreeToString(merkleTree),
                   requestTree: request.merkleTree,
@@ -179,50 +208,59 @@ export const ServerLive = Layer.effect(
             Effect.map(makeSyncTimestamp),
             Effect.map(timestampToString),
             Effect.tap((timestamp) =>
-              Effect.logDebug([
-                "Sync timestamp",
-                { timestamp },
-              ]),
+              Effect.logDebug(["Sync timestamp", { timestamp }]),
             ),
             Effect.flatMap((timestamp) =>
               Effect.promise(() => {
                 // Check if this is an initial sync (empty merkle tree)
-                const isInitialSync = request.merkleTree === merkleTreeToString(initialMerkleTree);
-                
-                return db
-                  .selectFrom("message")
-                  .select(["timestamp", "content"])
-                  .where("userId", "=", request.userId)
-                  .where("timestamp", ">=", timestamp)
-                  .orderBy("timestamp")
-                  // Use higher limit for initial sync
-                  .limit(isInitialSync ? 1000 : 50)
-                  .execute();
+                const isInitialSync =
+                  request.merkleTree === merkleTreeToString(initialMerkleTree);
+
+                return (
+                  db
+                    .selectFrom("message")
+                    .select(["timestamp", "content"])
+                    .where("userId", "=", request.userId)
+                    .where("timestamp", ">=", timestamp)
+                    .orderBy("timestamp")
+                    // Use higher limit for initial sync
+                    .limit(isInitialSync ? 1000 : 50)
+                    .execute()
+                );
               }),
             ),
-            Effect.map((msgs) => 
-              msgs.map(msg => ({
+            Effect.map((msgs) =>
+              msgs.map((msg) => ({
                 timestamp: msg.timestamp,
-                content: msg.content instanceof Uint8Array ? msg.content : new Uint8Array(msg.content),
-              }))
+                content:
+                  msg.content instanceof Uint8Array
+                    ? msg.content
+                    : new Uint8Array(msg.content),
+              })),
             ),
             Effect.tap((msgs) =>
               Effect.logDebug([
                 "Messages selected for sync",
                 {
                   count: msgs.length,
-                  timestamps: msgs.map(m => m.timestamp),
-                  isInitialSync: request.merkleTree === merkleTreeToString(initialMerkleTree),
+                  timestamps: msgs.map((m) => m.timestamp),
+                  isInitialSync:
+                    request.merkleTree ===
+                    merkleTreeToString(initialMerkleTree),
                 },
               ]),
             ),
             Effect.catchAll(() => Effect.succeed([])),
           );
 
+          console.log("Messages:", messages);
+
           const syncResponse = {
             merkleTree: currentMerkleTreeString,
             messages,
           };
+
+          console.log("Sync response:", syncResponse);
 
           try {
             const response = SyncResponse.toBinary(syncResponse);
